@@ -1,0 +1,141 @@
+#include <Arduino_BMI270_BMM150.h>
+#include <ArduinoBLE.h>
+
+const float ACCEL_THRESHOLD_LOW = 30.0;
+const float ACCEL_THRESHOLD_MEDIUM = 40.0;
+const float ACCEL_THRESHOLD_HIGH = 50.0;
+const float GYRO_THRESHOLD_LOW = 300.0;
+const float GYRO_THRESHOLD_MEDIUM = 500.0;
+const float GYRO_THRESHOLD_HIGH = 700.0;
+const int IMPACT_DURATION_THRESHOLD = 50;
+
+const int SPEAKER_PIN = 9;
+const int SPEAKER_FREQ_HIGH = 4000;
+const int BEEP_DURATION = 100;
+
+float accelOffset[3] = {0, 0, 0};
+float gyroOffset[3] = {0, 0, 0};
+
+BLEService impactService("180C");  // User defined service
+BLEStringCharacteristic impactCharacteristic("2A56", BLERead | BLENotify, 200);
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  if (!IMU.begin()) {
+    while (1);  // If IMU fails to initialize, stop here
+  }
+
+  if (!BLE.begin()) {
+    while (1);  // If BLE fails to initialize, stop here
+  }
+
+  calibrateSensors();
+
+  // Set up BLE
+  BLE.setLocalName("Arduino");
+  BLE.setAdvertisedService(impactService);
+  impactService.addCharacteristic(impactCharacteristic);
+  BLE.addService(impactService);
+
+  impactCharacteristic.setValue("No impact detected");
+}
+
+void loop() {
+  BLEDevice central = BLE.central();
+
+  if (central) {
+    digitalWrite(LED_BUILTIN, HIGH);
+
+    while (central.connected()) {
+      processImpact();
+    }
+
+    digitalWrite(LED_BUILTIN, LOW);
+  }
+  
+  BLE.advertise();  // Keep advertising when not connected
+  delay(100);  // Small delay to save power when not connected
+}
+
+void calibrateSensors() {
+  const int numReadings = 100;
+  for (int i = 0; i < numReadings; i++) {
+    float ax, ay, az, gx, gy, gz;
+    if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+      IMU.readAcceleration(ax, ay, az);
+      IMU.readGyroscope(gx, gy, gz);
+      accelOffset[0] += ax; accelOffset[1] += ay; accelOffset[2] += az;
+      gyroOffset[0] += gx; gyroOffset[1] += gy; gyroOffset[2] += gz;
+    }
+    delay(10);
+  }
+  for (int i = 0; i < 3; i++) {
+    accelOffset[i] /= numReadings;
+    gyroOffset[i] /= numReadings;
+  }
+}
+
+float calculateConcussionProbability(int impactLevel, float impactMagnitude) {
+  float baseProbability;
+  switch(impactLevel) {
+    case 1: baseProbability = 10.0; break;
+    case 2: baseProbability = 30.0; break;
+    case 3: baseProbability = 60.0; break;
+    default: return 0;
+  }
+  float magnitudeFactor = impactMagnitude / ACCEL_THRESHOLD_HIGH;
+  return min(baseProbability * magnitudeFactor, 100.0);
+}
+
+void processImpact() {
+  static unsigned long impactStartTime = 0;
+  static int impactLevel = 0;
+  static float maxImpactMagnitude = 0;
+
+  float accelX, accelY, accelZ, gyroX, gyroY, gyroZ;
+
+  if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+    IMU.readAcceleration(accelX, accelY, accelZ);
+    IMU.readGyroscope(gyroX, gyroY, gyroZ);
+
+    accelX -= accelOffset[0]; accelY -= accelOffset[1]; accelZ -= accelOffset[2];
+    gyroX -= gyroOffset[0]; gyroY -= gyroOffset[1]; gyroZ -= gyroOffset[2];
+
+    float accelMagnitude = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ);
+    float gyroMagnitude = sqrt(gyroX*gyroX + gyroY*gyroY + gyroZ*gyroZ);
+
+    int newImpactLevel = 0;
+    if (accelMagnitude > ACCEL_THRESHOLD_HIGH || gyroMagnitude > GYRO_THRESHOLD_HIGH) {
+      newImpactLevel = 3;
+      tone(SPEAKER_PIN, SPEAKER_FREQ_HIGH, BEEP_DURATION);
+    } else if (accelMagnitude > ACCEL_THRESHOLD_MEDIUM || gyroMagnitude > GYRO_THRESHOLD_MEDIUM) {
+      newImpactLevel = 2;
+    } else if (accelMagnitude > ACCEL_THRESHOLD_LOW || gyroMagnitude > GYRO_THRESHOLD_LOW) {
+      newImpactLevel = 1;
+    }
+
+    if (newImpactLevel > impactLevel) {
+      impactLevel = newImpactLevel;
+      impactStartTime = millis();
+      maxImpactMagnitude = accelMagnitude;
+    } else if (accelMagnitude > maxImpactMagnitude) {
+      maxImpactMagnitude = accelMagnitude;
+    }
+
+    if (impactLevel > 0 && millis() - impactStartTime > IMPACT_DURATION_THRESHOLD) {
+      float concussionProbability = calculateConcussionProbability(impactLevel, maxImpactMagnitude);
+      
+      String impactData = String(millis()) + "," + 
+                          String(accelX) + "," + String(accelY) + "," + String(accelZ) + "," +
+                          String(gyroX) + "," + String(gyroY) + "," + String(gyroZ) + "," +
+                          String(impactLevel == 3 ? "High" : (impactLevel == 2 ? "Medium" : "Low")) + "," +
+                          String(concussionProbability, 1);
+      
+      impactCharacteristic.writeValue(impactData);
+      
+      impactLevel = 0;
+      maxImpactMagnitude = 0;
+    }
+  }
+}
